@@ -71,10 +71,6 @@ instance Exception DeserializeException
 -- Convenience hack until we write `runNetworkSink`.
 instance Serialize Void
 
-data ConduitPlan i o m r where
-  Leaf :: ConduitM i o m r                                          -> ConduitPlan i o m r
-  Node :: Typeable a => ConduitPlan i a m () -> ConduitPlan a o m r -> ConduitPlan i o m r
-
 
 data Pipeline :: (* -> *) -> [*] -> * where
   End  :: ConduitM i Void m r  -> Pipeline m '[i,()]
@@ -101,33 +97,6 @@ showPipeline p = "Plan [" ++ concat (intersperse "," (map show (pipelineTypes p)
 infixr `Step`
 
 
-instance Functor (ConduitPlan i o m) where
-  fmap f (Leaf c) = Leaf (fmap f c)
-  fmap f (Node l r) = Node l (fmap f r)
-
-
-deriving instance Typeable ConduitM
-
-
-instance (Typeable i, Typeable o, Typeable m, Typeable r, Typeable ConduitM) => Show (ConduitPlan i o m r) where
-  show (p :: ConduitPlan i o m r) = "Plan " ++ show (planTypes p)
-
-
-planTypes :: (Typeable i, Typeable o) => ConduitPlan i o m r -> [TypeRep]
-planTypes p = case planTypeTuples p of
-  []            -> []
-  (t1, t2):rest -> t1 : t2 : map snd rest
-
-
-planTypeTuples :: (Typeable i, Typeable o) => ConduitPlan i o m r -> [(TypeRep, TypeRep)]
-planTypeTuples (Leaf{} :: ConduitPlan i o m r) = [(typeOf (undefined :: i), typeOf (undefined :: o))]
-planTypeTuples (Node l r) = planTypeTuples l ++ planTypeTuples r
-
-
-(--->) :: (Monad m, Typeable a) => ConduitPlan i a m () -> ConduitPlan a o m r -> ConduitPlan i o m r
-(--->) = Node
-
-infixl 2 --->
 
 
 type PortNumber = Int
@@ -217,15 +186,6 @@ main = do
 
     ["length-pipeline", iStr]
       | Just i <- readMaybe iStr -> do
-
-          -- let plan =
-          --       Leaf (C.repeatM BS.getLine :: Source IO ByteString)
-          --       --->
-          --       Leaf (awaitForever $ \bs -> yield (BS.length bs))
-          --       --->
-          --       Leaf (awaitForever (liftIO . print) :: Sink Int IO ())
-
-          -- print plan -- prints all types in the pipeline
 
           let pipeline :: Pipeline IO '[(), ByteString, Int, ()]
               pipeline =
