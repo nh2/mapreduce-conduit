@@ -88,10 +88,10 @@ instance (Typeable i, PipelineTypes (Pipeline m (x ': y ': rest))) => PipelineTy
 
 -- TODO: Can we do the Show instance without UndecidableInstances?
 -- instance (PipelineTypes (Pipeline m types)) => Show (Pipeline m types) where
---   show x = "Plan [" ++ concat (intersperse "," (map show (pipelineTypes x))) ++ "]"
+--   show x = "Pipeline [" ++ concat (intersperse "," (map show (pipelineTypes x))) ++ "]"
 
 showPipeline :: (PipelineTypes a) => a -> String
-showPipeline p = "Plan [" ++ concat (intersperse "," (map show (pipelineTypes p))) ++ "]"
+showPipeline p = "Pipeline [" ++ concat (intersperse "," (map show (pipelineTypes p))) ++ "]"
 
 
 infixr `Step`
