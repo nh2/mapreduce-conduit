@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings, DeriveDataTypeable, GADTs, StandaloneDeriving, FlexibleContexts, ScopedTypeVariables, RankNTypes, DataKinds, TypeOperators, KindSignatures, FlexibleInstances #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module MapreduceConduit where
 
@@ -66,10 +65,6 @@ data DeserializeException = DeserializeException String
   deriving (Eq, Ord, Show, Typeable)
 
 instance Exception DeserializeException
-
-
--- Convenience hack until we write `runNetworkSink`.
-instance Serialize Void
 
 
 data Pipeline :: (* -> *) -> [*] -> * where
