@@ -184,37 +184,6 @@ instance (RunPipelineSink (Pipeline IO (fill1 ': fill2 ': fill3 ': rest))) => Ru
   runPipelineSink iPort (Step _ rest) = runPipelineSink iPort rest
 
 
--- class RunPipelineIndex pipeline where
---   runPipelineIndex :: Int -> [PortNumber] -> pipeline -> IO ()
-
--- instance RunPipelineIndex (Pipeline IO '[x,y]) where
---   runPipelineIndex _ _ _ = error "runPipelineIndex: pipeline has only 1 entry"
--- instance (Serialize a, Serialize b) => RunPipelineIndex (Pipeline IO '[a,b,()]) where
---   -- TODO: Why does GHC suggest I need this? It doesn't allow me to put `Step _ _` or `End _` for `_x`!
---   --       And I also don't think the `Step _ (Step _ _)` case is possible at all.
---   runPipelineIndex _ _                (Step _ (Step _ _)) = error "runPipelineIndex: cannot happen"
---   runPipelineIndex 0 (_:bPort:_)      (Step _ (End c))    = runNetworkSink (serverSettings bPort "*") (void c)
---   -- SOTA: Problem with this approach: if a is (), have to use runNetworkSource here.
---   --       But we can't check for this, that'd be overlapping instances of a and ().
---   --       Should probably continue with the 3 split functions approach above.
---   runPipelineIndex 1 (abPort:bPort:_) (Step c (End _))    = runNetworkConduit (serverSettings abPort "*") (clientSettings bPort "localhost") c
---   runPipelineIndex 0 _                (Step _ (End _))    = error "runPipelineIndex: out of ports"
---   runPipelineIndex n _                (Step _ (End _))
---     | n < 0                                               = error "runPipelineIndex: negative index"
---     | otherwise                                           = error "runPipelineIndex: out of bounds"
-
--- instance (Serialize i, Serialize o,
---           RunPipelineIndex (Pipeline IO (o ': fill1 ': fill2 ': rest)))
---          => RunPipelineIndex (Pipeline IO (i ': o ': fill1 ': fill2 ': rest)) where
---   runPipelineIndex 2 (iPort:oPort:_) p = case p of
---     Step c _ -> runNetworkConduit (serverSettings iPort "*") (clientSettings oPort "localhost") c
---   runPipelineIndex n (_:ports) (Step _ rest)
---     | n == 0 = error "runPipelineIndex: cannot start a source; use runPipelineSource"
---     | n <  0 = error "runPipelineIndex: negative index"
---     | otherwise = runPipelineIndex (n-1) ports rest
---   runPipelineIndex _ [] _ = error "runPipelineIndex: out of ports"
-
-
 main :: IO ()
 main = do
   let inPort  i = serverSettings i "*"
