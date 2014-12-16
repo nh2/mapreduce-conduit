@@ -82,6 +82,12 @@ data Pipeline :: (* -> *) -> [*] -> * where
     -> Pipeline m (i ': o ': rest)
 
 
+(---->) :: ConduitM i o m () -> Pipeline m (o ': rest) -> Pipeline m (i ': o ': rest)
+c ----> pipeline = Step c pipeline
+
+infixr 2 ---->
+
+
 class PipelineTypes a where
   pipelineTypes :: a -> [TypeRep]
 
@@ -194,9 +200,9 @@ main = do
           let pipeline :: Pipeline IO '[(), ByteString, Int, ()]
               pipeline =
                 (C.repeatM BS.getLine)
-                `Step`
+                ---->
                 (awaitForever $ \bs -> yield (BS.length bs))
-                `Step`
+                ---->
                 End (awaitForever (liftIO . print))
 
           putStrLn $ showPipeline pipeline -- prints all types in the pipeline
