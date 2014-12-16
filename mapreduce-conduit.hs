@@ -196,28 +196,39 @@ main = do
 
           let n = length (pipelineTypes pipeline) - 1 -- TODO: This is just lazy
               portRange = take (n-1) [10000..]
-              ports = (portRange `atMay` (i-1), portRange `atMay` i)
 
-          putStrLn $ "Pipeline length is " ++ show n
-
-          if
-            -- Bad index
-            | i < 0    -> error "cannot run pipeline step with negative index"
-            | i >= n   -> error "pipeline step index exceeds pipeline length"
-
-            -- Source
-            | i == 0 -> case ports of
-                (Nothing, Just port) -> runPipelineSource port pipeline
-                _                    -> error $ "runPipelineIndex: bad source ports: " ++ show ports
-
-            -- Sink
-            | i == n-1 -> case ports of
-                (Just port, Nothing) -> runPipelineSink port pipeline
-                _                    -> error $ "runPipelineIndex: bad sink ports: " ++ show ports
-
-            -- In between: Conduit
-            | (Just iPort, Just oPort) <- ports -> runPipelineConduit i (iPort, oPort) pipeline
-            | otherwise                         -> error $ "runPipelineIndex: bad conduit ports: " ++ show ports
-
+          runPipelineIndex pipeline i ( portRange `atMay` (i-1)
+                                      , portRange `atMay` i
+                                      )
     _ ->
       error "bad arguments"
+
+
+-- Runs a pipeline that has at least one conduit inside.
+runPipelineIndex :: (PipelineTypes (Pipeline IO (() ': o ': rest)),
+                     RunPipelineConduit (Pipeline IO (() ': o ': rest)),
+                     RunPipelineSink (Pipeline IO (() ': o ': rest)), Serialize o)
+                 => Pipeline IO (() ': o ': rest)
+                 -> Int
+                 -> (Maybe PortNumber, Maybe PortNumber)
+                 -> IO ()
+runPipelineIndex pipeline i ports = if
+  -- Bad index
+  | i < 0    -> error "cannot run pipeline step with negative index"
+  | i >= n   -> error "pipeline step index exceeds pipeline length"
+
+  -- Source
+  | i == 0 -> case ports of
+      (Nothing, Just port) -> runPipelineSource port pipeline
+      _                    -> error $ "runPipelineIndex: bad source ports: " ++ show ports
+
+  -- Sink
+  | i == n-1 -> case ports of
+      (Just port, Nothing) -> runPipelineSink port pipeline
+      _                    -> error $ "runPipelineIndex: bad sink ports: " ++ show ports
+
+  -- In between: Conduit
+  | (Just iPort, Just oPort) <- ports -> runPipelineConduit i (iPort, oPort) pipeline
+  | otherwise                         -> error $ "runPipelineIndex: bad conduit ports: " ++ show ports
+  where
+    n = length (pipelineTypes pipeline) - 1 -- TODO: This is just lazy
