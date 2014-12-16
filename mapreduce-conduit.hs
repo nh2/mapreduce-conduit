@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, DeriveDataTypeable, GADTs, StandaloneDeriving, FlexibleContexts, ScopedTypeVariables, RankNTypes, DataKinds, TypeOperators, KindSignatures, FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings, DeriveDataTypeable, GADTs, StandaloneDeriving, FlexibleContexts, ScopedTypeVariables, RankNTypes, DataKinds, TypeOperators, KindSignatures, FlexibleInstances, MultiWayIf #-}
 
 module MapreduceConduit where
 
@@ -12,6 +12,7 @@ import           Data.Conduit
 import qualified Data.Conduit.Combinators as C
 import           Data.Conduit.Network
 import           Data.List (intersperse)
+import           Safe (atMay)
 import           Data.Serialize
 import           Data.Typeable
 import           Data.Void
@@ -98,15 +99,15 @@ type PortNumber = Int
 
 
 class RunPipelineConduit pipeline where
-  runPipelineConduit :: Int -> [PortNumber] -> pipeline -> IO ()
+  runPipelineConduit :: Int -> (PortNumber, PortNumber) -> pipeline -> IO ()
 
 instance RunPipelineConduit (Pipeline IO '[a,b,c]) where
   runPipelineConduit 0 _ _ = error "runPipelineConduit: cannot start a sink; use runPipelineSink"
-  runPipelineConduit _ _ _ = error "runPipelineConduit: out of bounds"
+  runPipelineConduit n _ _ = error $ "runPipelineConduit: out of bounds (3): " ++ show n
 instance (Serialize i, Serialize o,
           RunPipelineConduit (Pipeline IO (i ': o ': fill ': rest)))
          => RunPipelineConduit (Pipeline IO (pre ': i ': o ': fill ': rest)) where
-  runPipelineConduit 1 (iPort:oPort:_) p = case p of
+  runPipelineConduit 1 (iPort, oPort) p = case p of
     Step _ (Step c _) -> do
       putStrLn $ "Running conduit at " ++ show iPort ++ " to " ++ show oPort
       runNetworkConduit (serverSettings iPort "*") (clientSettings oPort "localhost") c
@@ -115,11 +116,10 @@ instance (Serialize i, Serialize o,
     --   https://ghc.haskell.org/trac/ghc/ticket/3927
     -- So we have to add this one:
     _ -> error "runPipelineConduit: cannot happen"
-  runPipelineConduit n (_:ports) (Step _ rest)
+  runPipelineConduit n ports (Step _ rest)
     | n == 0 = error "runPipelineConduit: cannot start a source; use runPipelineSource"
     | n <  0 = error "runPipelineConduit: negative index"
     | otherwise = runPipelineConduit (n-1) ports rest
-  runPipelineConduit _ [] _ = error "runPipelineConduit: out of ports"
 
 runPipelineSource :: (Serialize o) => PortNumber -> Pipeline IO (() ': o ': rest) -> IO ()
 runPipelineSource oPort p = case p of
@@ -194,15 +194,30 @@ main = do
 
           putStrLn $ "Running step number " ++ show (i :: Int)
 
-          let ports = [10000..]
-              n = length (pipelineTypes pipeline) - 1 -- TODO: This is just lazy
+          let n = length (pipelineTypes pipeline) - 1 -- TODO: This is just lazy
+              portRange = take (n-1) [10000..]
+              ports = (portRange `atMay` (i-1), portRange `atMay` i)
+
           putStrLn $ "Pipeline length is " ++ show n
-          case i of
-            0 -> runPipelineSource (head ports) pipeline
-            _ | i < 0    -> error "cannot run pipeline step with negative index"
-              | i >= n   -> error "pipeline step index exceeds pipeline length"
-              | i == n-1 -> runPipelineSink (ports !! (i-1)) pipeline
-            _ -> runPipelineConduit i ports pipeline
+
+          if
+            -- Bad index
+            | i < 0    -> error "cannot run pipeline step with negative index"
+            | i >= n   -> error "pipeline step index exceeds pipeline length"
+
+            -- Source
+            | i == 0 -> case ports of
+                (Nothing, Just port) -> runPipelineSource port pipeline
+                _                    -> error $ "runPipelineIndex: bad source ports: " ++ show ports
+
+            -- Sink
+            | i == n-1 -> case ports of
+                (Just port, Nothing) -> runPipelineSink port pipeline
+                _                    -> error $ "runPipelineIndex: bad sink ports: " ++ show ports
+
+            -- In between: Conduit
+            | (Just iPort, Just oPort) <- ports -> runPipelineConduit i (iPort, oPort) pipeline
+            | otherwise                         -> error $ "runPipelineIndex: bad conduit ports: " ++ show ports
 
     _ ->
       error "bad arguments"
