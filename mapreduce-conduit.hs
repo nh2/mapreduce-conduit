@@ -192,8 +192,6 @@ main = do
 
           putStrLn $ showPipeline pipeline -- prints all types in the pipeline
 
-          putStrLn $ "Running step number " ++ show (i :: Int)
-
           let n = length (pipelineTypes pipeline) - 1 -- TODO: This is just lazy
               portRange = take (n-1) [10000..]
 
