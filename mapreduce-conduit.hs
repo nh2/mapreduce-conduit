@@ -69,8 +69,17 @@ instance Exception DeserializeException
 
 
 data Pipeline :: (* -> *) -> [*] -> * where
-  End  :: ConduitM i Void m r  -> Pipeline m '[i,()]
-  Step :: ConduitM i o    m () -> Pipeline m (o ': rest) -> Pipeline m (i ': o ': rest)
+
+  End
+    :: { endConduit :: ConduitM i Void m r
+       }
+    -> Pipeline m '[i,()]
+
+  Step
+    :: { stepConduit :: ConduitM i o m ()
+       , tailPipeline :: Pipeline m (o ': rest)
+       }
+    -> Pipeline m (i ': o ': rest)
 
 
 class PipelineTypes a where
