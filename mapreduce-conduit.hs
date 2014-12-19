@@ -200,7 +200,16 @@ instance Show ServerAddr where
   show (ServerAddr ss) = "ServerAddr " ++ show (getPort ss)
 
 
+type StageCounts = [Int]
 type StageMap = Map.Map Int [Int]
+
+
+mkStageMap :: StageCounts -> [PortNumber] -> StageMap
+mkStageMap stageCounts ports = Map.fromListWith (flip (++)) stages -- TODO check if this is the bad-associative ++
+  where
+    -- TODO total tail
+    stages = zip [ x | (s, c) <- zip [(0::Int)..] (tail stageCounts), x <- replicate c s ]
+                 [ [p] | p <- ports ]
 
 
 main :: IO ()
@@ -261,14 +270,6 @@ main = do
                 | BS.null bs = 0
                 | otherwise  = fromIntegral (BS.head bs) `rem` 26
 
-              stageCounts = [1, 3, 1]
-              -- TODO total tail
-          let stages = zip [ x | (s, c) <- zip [(0::Int)..] (tail stageCounts), x <- replicate c s ]
-                           [ [p] | p <- [10001..] ]
-              stageMap :: StageMap
-              stageMap = Map.fromListWith (flip (++)) stages -- TODO check if this is the bad-associative ++
-
-          print stageMap
 
           let pipeline :: Pipeline IO '[(), ByteString, Int, ()]
               pipeline =
@@ -278,7 +279,12 @@ main = do
                 ---->
                 End (awaitForever (liftIO . print))
 
+
+          let stageCounts = [1, 3, 1] -- how many of each conduit to spawn
+              stageMap    = mkStageMap stageCounts [10000..]
+
           putStrLn $ showPipeline pipeline -- prints all types in the pipeline
+          print stageMap
 
           runPipelineIndexSharded pipeline i stageCounts stageMap
 
