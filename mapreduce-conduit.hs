@@ -1,17 +1,21 @@
-{-# LANGUAGE OverloadedStrings, DeriveDataTypeable, GADTs, StandaloneDeriving, FlexibleContexts, ScopedTypeVariables, RankNTypes, DataKinds, TypeOperators, KindSignatures, FlexibleInstances, MultiWayIf #-}
+{-# LANGUAGE OverloadedStrings, DeriveDataTypeable, GADTs, StandaloneDeriving, FlexibleContexts, ScopedTypeVariables, RankNTypes, DataKinds, TypeOperators, KindSignatures, FlexibleInstances, MultiWayIf, NamedFieldPuns, ParallelListComp #-}
 
 module MapreduceConduit where
 
-import           Control.Monad
 import           Control.Applicative
+import           Control.Concurrent.Async (mapConcurrently)
+import           Control.Monad
+import           Control.Monad.IO.Class (MonadIO)
 import           Control.Exception
 import           Control.Monad.IO.Class (liftIO)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import           Data.Conduit
 import qualified Data.Conduit.Combinators as C
 import           Data.Conduit.Network
 import           Data.List (intersperse)
+import qualified Data.Map as Map
 import           Safe (atMay)
 import           Data.Serialize
 import           Data.Typeable
@@ -22,35 +26,37 @@ import           System.Environment
 
 
 
+sendConduit :: (Serialize i, MonadIO m) => (i -> Int) -> [ClientAddr] -> ConduitM i o m ()
+sendConduit hashFun oAddrs = awaitForever $ \o -> liftIO $ do
+  let oAddr = oAddrs !! (hashFun o `mod` length oAddrs)
+  runTCPClient (unClientAddr oAddr) $ \outConn -> do -- TODO We don't want to open the conn for each of our clients
+    let bsSink = appSink outConn
+    liftIO . putStrLn $ "Connected to server " ++ show oAddr
+    yield (encode o) $$ bsSink
+
+
 -- TODO The ByteStrings we want to deserialise from bsSource can likely be
 --      split across multiple ByteStrings since it just calls Unix's `recv`
 --      inside. We will likely have to buffer and send a size first.
 
 runNetworkConduit :: (Serialize i, Serialize o)
-                  => ServerSettings -> ClientSettings -> Conduit i IO o -> IO ()
-runNetworkConduit ss cs c = do
-  runTCPServer ss $ \inConn -> do
-    liftIO $ putStrLn "Client connected"
-    runTCPClient cs $ \outConn -> do -- TODO We don't want to open the conn for each of our clients
-      let bsSource = appSource inConn
-      let bsSink   = appSink   outConn
-      liftIO $ putStrLn "Connected to server"
-
-      bsSource $$ C.mapM decodeOrThrow $= c $= C.map encode $= bsSink
+                  => ServerAddr -> (o -> Int) -> [ClientAddr] -> Conduit i IO o -> IO ()
+runNetworkConduit iAddr hashFun oAddrs c = do
+  runTCPServer (unServerAddr iAddr) $ \inConn -> do
+    liftIO $ putStrLn $ "Client connected to " ++ show iAddr
+    let bsSource = appSource inConn
+    bsSource $$ C.mapM decodeOrThrow $= c $= sendConduit hashFun oAddrs
 
 
-runNetworkSource :: (Serialize o) => ClientSettings -> Source IO o -> IO ()
-runNetworkSource cs source = do
-  runTCPClient cs $ \outConn -> do
-    liftIO $ putStrLn "Connected to server"
-    liftIO $ print (appSockAddr outConn)
-    source $$ C.map encode $= appSink outConn
+runNetworkSource :: (Serialize o) => (o -> Int) -> [ClientAddr] -> Source IO o -> IO ()
+runNetworkSource hashFun oAddrs source = do
+  source $$ sendConduit hashFun oAddrs
 
 
-runNetworkSink :: (Serialize i) => ServerSettings -> Sink i IO () -> IO ()
-runNetworkSink ss sink = do
-  runTCPServer ss $ \inConn -> do
-    liftIO $ putStrLn "Client connected"
+runNetworkSink :: (Serialize i) => ServerAddr -> Sink i IO () -> IO ()
+runNetworkSink iAddr sink = do
+  runTCPServer (unServerAddr iAddr) $ \inConn -> do
+    liftIO $ putStrLn $ "Client connected to " ++ show iAddr
     appSource inConn $$ C.mapM decodeOrThrow $= sink
 
 
@@ -77,15 +83,31 @@ data Pipeline :: (* -> *) -> [*] -> * where
 
   Step
     :: { stepConduit :: ConduitM i o m ()
+       , stepHashFun :: o -> Int
        , tailPipeline :: Pipeline m (o ': rest)
        }
     -> Pipeline m (i ': o ': rest)
 
 
 (---->) :: ConduitM i o m () -> Pipeline m (o ': rest) -> Pipeline m (i ': o ': rest)
-c ----> pipeline = Step c pipeline
+c ----> pipeline = Step c (const 0) pipeline
 
 infixr 2 ---->
+
+
+data StepParams i o m = StepParams
+  { paramConduit :: ConduitM i o m ()
+  , paramHashFun :: o -> Int
+  }
+
+withHashFun :: ConduitM i o m () -> (o -> Int) -> StepParams i o m
+withHashFun = StepParams
+
+(--->) :: StepParams i o m -> Pipeline m (o ': rest) -> Pipeline m (i ': o ': rest)
+StepParams{ paramConduit, paramHashFun } ---> pipeline = Step paramConduit paramHashFun pipeline
+
+infixr 2 --->
+
 
 
 class PipelineTypes a where
@@ -94,7 +116,7 @@ class PipelineTypes a where
 instance (Typeable i, Typeable o) => PipelineTypes (Pipeline m '[i,o]) where
   pipelineTypes _ = [typeOf (undefined :: i), typeOf (undefined :: o)]
 instance (Typeable i, PipelineTypes (Pipeline m (x ': y ': rest))) => PipelineTypes (Pipeline m (i ': x ': y ': rest)) where
-  pipelineTypes (Step _ rest) = typeOf (undefined :: i) : pipelineTypes rest
+  pipelineTypes (Step _ _ rest) = typeOf (undefined :: i) : pipelineTypes rest
 
 
 -- TODO: Can we do the Show instance without UndecidableInstances?
@@ -108,72 +130,91 @@ showPipeline p = "Pipeline [" ++ concat (intersperse "," (map show (pipelineType
 infixr `Step`
 
 
+-- TODO: This is just lazy
+pipelineLength :: (PipelineTypes p) => p -> Int
+pipelineLength pipeline = length (pipelineTypes pipeline) - 1
 
 
 type PortNumber = Int
 
 
 class RunPipelineConduit pipeline where
-  runPipelineConduit :: Int -> (PortNumber, PortNumber) -> pipeline -> IO ()
+  runPipelineConduit :: Int -> ServerAddr -> [ClientAddr] -> pipeline -> IO ()
 
 instance RunPipelineConduit (Pipeline IO '[a,b,c]) where
-  runPipelineConduit 0 _ _ = error "runPipelineConduit: cannot start a sink; use runPipelineSink"
-  runPipelineConduit n _ _ = error $ "runPipelineConduit: out of bounds (3): " ++ show n
+  runPipelineConduit 0 _ _ _ = error "runPipelineConduit: cannot start a sink; use runPipelineSink"
+  runPipelineConduit n _ _ _ = error $ "runPipelineConduit: out of bounds (3): " ++ show n
 instance (Serialize i, Serialize o,
           RunPipelineConduit (Pipeline IO (i ': o ': fill ': rest)))
          => RunPipelineConduit (Pipeline IO (pre ': i ': o ': fill ': rest)) where
-  runPipelineConduit 1 (iPort, oPort) p = case p of
-    Step _ (Step c _) -> do
-      putStrLn $ "Running conduit at " ++ show iPort ++ " to " ++ show oPort
-      runNetworkConduit (serverSettings iPort "*") (clientSettings oPort "localhost") c
+  runPipelineConduit 1 iAddr oAddrs p = case p of
+    Step _ _ (Step c hashFun _) -> do
+      putStrLn $ "Running conduit at " ++ show iAddr ++ " to " ++ show oAddrs
+      runNetworkConduit iAddr hashFun oAddrs c
     -- If we only use the pattern above (which is the only possible one),
     -- GHC 7.8 gives a spurious Patterns not matched: Step _ (End _), see
     --   https://ghc.haskell.org/trac/ghc/ticket/3927
     -- So we have to add this one:
     _ -> error "runPipelineConduit: cannot happen"
-  runPipelineConduit n ports (Step _ rest)
+  runPipelineConduit n iAddr oAddrs (Step _ _ rest)
     | n == 0 = error "runPipelineConduit: cannot start a source; use runPipelineSource"
     | n <  0 = error "runPipelineConduit: negative index"
-    | otherwise = runPipelineConduit (n-1) ports rest
+    | otherwise = runPipelineConduit (n-1) iAddr oAddrs rest
 
-runPipelineSource :: (Serialize o) => PortNumber -> Pipeline IO (() ': o ': rest) -> IO ()
-runPipelineSource oPort p = case p of
+runPipelineSource :: (Serialize o) => [ClientAddr] -> Pipeline IO (() ': o ': rest) -> IO ()
+runPipelineSource oAddrs p = case p of
   -- TODO: We can probably prevent that on the type level by requiring pipelines
   --       to have at least 3 entries.
-  End{}    -> error "runPipelineSource: pipline has only 1 entry"
-  Step c _ -> do
-    putStrLn $ "Running source at " ++ show oPort
-    runNetworkSource (clientSettings oPort "localhost") c
+  End{}            -> error "runPipelineSource: pipline has only 1 entry"
+  Step c hashFun _ -> do
+    putStrLn $ "Running source to " ++ show oAddrs
+    runNetworkSource hashFun oAddrs c
 
 
 class RunPipelineSink pipeline where
-  runPipelineSink :: PortNumber -> pipeline -> IO ()
+  runPipelineSink :: ServerAddr -> pipeline -> IO ()
 
 instance RunPipelineSink (Pipeline IO '[x,y]) where
   runPipelineSink _ _ = error "runPipelineSink: pipeline has only 1 entry"
 instance (Serialize i) => RunPipelineSink (Pipeline IO '[x,i,()]) where
-  runPipelineSink iPort (Step _ (End c)) = do
-    putStrLn $ "Running sink at " ++ show iPort
-    runNetworkSink (serverSettings iPort "*") (void c)
+  runPipelineSink iAddr (Step _ _ (End c)) = do
+    putStrLn $ "Running sink at " ++ show iAddr
+    runNetworkSink iAddr (void c)
   -- TODO: Why does GHC suggest I need this? It doesn't allow me to put `Step _ _` or `End _` for `_x`!
   --       And I also don't think the `Step _ (Step _ _)` case is possible at all.
   --       See https://ghc.haskell.org/trac/ghc/ticket/3927
-  runPipelineSink _     (Step _ (Step _ _x)) = error "runPipelineSink: cannot happen"
+  runPipelineSink _     (Step _ _ (Step _ _x _)) = error "runPipelineSink: cannot happen"
 instance (RunPipelineSink (Pipeline IO (fill1 ': fill2 ': fill3 ': rest))) => RunPipelineSink (Pipeline IO (x ': fill1 ': fill2 ': fill3 ': rest)) where
-  runPipelineSink iPort (Step _ rest) = runPipelineSink iPort rest
+  runPipelineSink iAddr (Step _ _ rest) = runPipelineSink iAddr rest
+
+
+newtype ClientAddr = ClientAddr { unClientAddr :: ClientSettings }
+
+instance Show ClientAddr where
+  show (ClientAddr cs) = "ClientAddr " ++ BS8.unpack (getHost cs) ++ ":" ++ show (getPort cs)
+
+
+newtype ServerAddr = ServerAddr { unServerAddr :: ServerSettings }
+
+instance Show ServerAddr where
+  show (ServerAddr ss) = "ServerAddr " ++ show (getPort ss)
+
+
+type StageMap = Map.Map Int [Int]
 
 
 main :: IO ()
 main = do
-  let inPort  i = serverSettings i "*"
-      outPort o = clientSettings o "localhost"
+  let inAddr  i = ServerAddr $ serverSettings i "*"
+      outAddr o = ClientAddr $ clientSettings o "localhost"
+      hash0     = const 0
 
   args <- getArgs
   case args of
 
     ["BS.length", iPortStr, oPortStr]
-      | Just i <- inPort  <$> readMaybe iPortStr
-      , Just o <- outPort <$> readMaybe oPortStr -> runNetworkConduit i o $ do
+      | Just i <- inAddr  <$> readMaybe iPortStr
+      , Just o <- outAddr <$> readMaybe oPortStr -> runNetworkConduit i hash0 [o] $ do
 
           awaitForever $ \bs ->
             yield (BS.length bs)
@@ -181,14 +222,14 @@ main = do
               :: Conduit ByteString IO Int
 
     ["BS.getLine", oPortStr]
-      | Just o <- outPort <$> readMaybe oPortStr -> runNetworkSource o $ do
+      | Just o <- outAddr <$> readMaybe oPortStr -> runNetworkSource hash0 [o] $ do
 
           C.repeatM BS.getLine
 
             :: Source IO ByteString
 
     ["BS.putStrLn", iPortStr]
-      | Just i <- inPort <$> readMaybe iPortStr -> runNetworkSink i $ do
+      | Just i <- inAddr <$> readMaybe iPortStr -> runNetworkSink i $ do
 
           awaitForever $ liftIO . print
 
@@ -210,38 +251,90 @@ main = do
           let n = length (pipelineTypes pipeline) - 1 -- TODO: This is just lazy
               portRange = take (n-1) [10000..]
 
-          runPipelineIndex pipeline i ( portRange `atMay` (i-1)
-                                      , portRange `atMay` i
-                                      )
+          runPipelineIndexPortRange pipeline i portRange
+
+    ["sharded-length-pipeline", iStr]
+      | Just i <- readMaybe iStr -> do
+
+          let firstCharHash :: ByteString -> Int
+              firstCharHash bs
+                | BS.null bs = 0
+                | otherwise  = fromIntegral (BS.head bs) `rem` 26
+
+              stageCounts = [1, 3, 1]
+              -- TODO total tail
+          let stages = zip [ x | (s, c) <- zip [(0::Int)..] (tail stageCounts), x <- replicate c s ]
+                           [ [p] | p <- [10001..] ]
+              stageMap :: StageMap
+              stageMap = Map.fromListWith (flip (++)) stages -- TODO check if this is the bad-associative ++
+
+          print stageMap
+
+          let pipeline :: Pipeline IO '[(), ByteString, Int, ()]
+              pipeline =
+                (C.repeatM BS.getLine) `withHashFun` firstCharHash
+                --->
+                (awaitForever $ \bs -> yield (BS.length bs))
+                ---->
+                End (awaitForever (liftIO . print))
+
+          putStrLn $ showPipeline pipeline -- prints all types in the pipeline
+
+          runPipelineIndexSharded pipeline i stageCounts stageMap
+
     _ ->
       error "bad arguments"
 
 
+runPipelineIndexPortRange :: (Serialize o,
+                              RunPipelineSink (Pipeline IO (() ': o ': rest)),
+                              RunPipelineConduit (Pipeline IO (() ': o ': rest)),
+                              PipelineTypes (Pipeline IO (() ': o ': rest)))
+                          => Pipeline IO (() ': o ': rest)
+                          -> Int
+                          -> [Int]
+                          -> IO ()
+runPipelineIndexPortRange pipeline i portRange = runPipelineIndexSharded pipeline i stageCounts stageMap
+  where
+    stageCounts = replicate (pipelineLength pipeline) 1
+    stageMap    = Map.fromList [ (x, [p]) | (x, p) <- zip [0..] portRange ]
+
+
 -- Runs a pipeline that has at least one conduit inside.
-runPipelineIndex :: (PipelineTypes (Pipeline IO (() ': o ': rest)),
-                     RunPipelineConduit (Pipeline IO (() ': o ': rest)),
-                     RunPipelineSink (Pipeline IO (() ': o ': rest)), Serialize o)
-                 => Pipeline IO (() ': o ': rest)
-                 -> Int
-                 -> (Maybe PortNumber, Maybe PortNumber)
-                 -> IO ()
-runPipelineIndex pipeline i ports = if
+runPipelineIndexSharded :: (Serialize o,
+                            RunPipelineSink (Pipeline IO (() ': o ': rest)),
+                            RunPipelineConduit (Pipeline IO (() ': o ': rest)),
+                            PipelineTypes (Pipeline IO (() ': o ': rest)))
+                        => Pipeline IO (() ': o ': rest)
+                        -> Int
+                        -> [Int]
+                        -> Map.Map Int [Int]
+                        -> IO ()
+runPipelineIndexSharded pipeline i stageCounts stageMap = if
   -- Bad index
   | i < 0    -> error "cannot run pipeline step with negative index"
   | i >= n   -> error "pipeline step index exceeds pipeline length"
 
   -- Source
-  | i == 0 -> case ports of
-      (Nothing, Just port) -> runPipelineSource port pipeline
-      _                    -> error $ "runPipelineIndex: bad source ports: " ++ show ports
+  | i == 0 -> case stageCounts `atMay` 0 of
+      Just c  -> runAll [1..c] $ \_ -> runPipelineSource oAddrs pipeline
+      Nothing -> error "runPipelineIndex: source has no stageCount"
 
   -- Sink
-  | i == n-1 -> case ports of
-      (Just port, Nothing) -> runPipelineSink port pipeline
-      _                    -> error $ "runPipelineIndex: bad sink ports: " ++ show ports
+  | i == n-1 -> runAll iAddrs $ \iAddr -> runPipelineSink iAddr pipeline
 
   -- In between: Conduit
-  | (Just iPort, Just oPort) <- ports -> runPipelineConduit i (iPort, oPort) pipeline
-  | otherwise                         -> error $ "runPipelineIndex: bad conduit ports: " ++ show ports
+  | otherwise -> runAll iAddrs $ \iAddr -> runPipelineConduit i iAddr oAddrs pipeline
   where
-    n = length (pipelineTypes pipeline) - 1 -- TODO: This is just lazy
+    n = pipelineLength pipeline
+
+    iAddrs = map (\p -> ServerAddr $ serverSettings p "*") $ case Map.lookup (i-1) stageMap of
+               Nothing -> error "runPipelineIndex: iAddrs: out of range"
+               Just ps -> ps
+
+    oAddrs = map (\p -> ClientAddr $ clientSettings p "localhost") $ case Map.lookup i stageMap of
+               Nothing -> error "runPipelineIndex: oAddrs: out of range"
+               Just ps -> ps
+
+    runAll :: [a] -> (a -> IO ()) -> IO ()
+    runAll l f = void $ mapConcurrently f l
